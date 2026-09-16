@@ -38,6 +38,7 @@ class MainActivity : FragmentActivity() {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
         AppContext.context = applicationContext
+        cleanupPreviewCache(applicationContext)
         setContent { SecureVaultApp() }
     }
 }
@@ -268,6 +269,7 @@ fun VaultHome(lock: () -> Unit) {
                         delete = {
                             scope.launch {
                                 withContext(Dispatchers.IO) { repo.delete(f) }
+                                invalidatePreview(c, f)
                                 files = withContext(Dispatchers.IO) { repo.list() }
                             }
                         }
@@ -336,11 +338,8 @@ fun sizeText(n: Long): String {
 fun PreviewDialog(f: VaultFile, repo: VaultRepository, close: () -> Unit) {
     val c = LocalContext.current
     val scope = rememberCoroutineScope()
-    var temp by remember { mutableStateOf<File?>(null) }
     var error by remember { mutableStateOf("") }
     var opening by remember { mutableStateOf(false) }
-
-    DisposableEffect(Unit) { onDispose { temp?.delete() } }
 
     AlertDialog(
         onDismissRequest = close,
@@ -359,12 +358,8 @@ fun PreviewDialog(f: VaultFile, repo: VaultRepository, close: () -> Unit) {
                             error = ""
                             runCatching {
                                 val x = withContext(Dispatchers.IO) {
-                                    File.createTempFile("sv_preview_", suffix(f.name), c.cacheDir).also {
-                                        repo.decryptTo(f, it)
-                                    }
+                                    getOrCreatePreview(c, f, repo)
                                 }
-                                temp?.delete()
-                                temp = x
                                 val uri = FileProvider.getUriForFile(c, "${c.packageName}.files", x)
                                 c.startActivity(Intent(Intent.ACTION_VIEW).apply {
                                     setDataAndType(uri, f.mime)
@@ -374,11 +369,29 @@ fun PreviewDialog(f: VaultFile, repo: VaultRepository, close: () -> Unit) {
                             opening = false
                         }
                     }
-                ) { Text(if (opening) "Открытие…" else "Открыть") }
+                ) { Text(if (opening) "Подготовка…" else "Открыть") }
             }
         },
         confirmButton = { TextButton(onClick = close) { Text("Закрыть") } }
     )
+}
+
+private fun previewDir(c: Context) = File(c.cacheDir, "vault_previews").apply { mkdirs() }
+
+private fun getOrCreatePreview(c: Context, f: VaultFile, repo: VaultRepository): File {
+    val target = File(previewDir(c), "${f.id}${suffix(f.name)}")
+    if (target.exists() && target.length() > 0L) return target
+    target.delete()
+    return target.also { repo.decryptTo(f, it) }
+}
+
+private fun invalidatePreview(c: Context, f: VaultFile) {
+    File(previewDir(c), "${f.id}${suffix(f.name)}").delete()
+}
+
+private fun cleanupPreviewCache(c: Context) {
+    val dir = File(c.cacheDir, "vault_previews")
+    dir.listFiles()?.forEach { it.delete() }
 }
 
 fun suffix(n: String) = n.substringAfterLast('.', ".tmp").let { if (it.startsWith(".")) it else ".${it}" }
