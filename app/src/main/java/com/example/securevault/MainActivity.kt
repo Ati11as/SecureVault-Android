@@ -27,6 +27,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
 import androidx.fragment.app.FragmentActivity
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.text.DecimalFormat
 
@@ -168,58 +171,80 @@ fun AuthLayout(
 fun VaultHome(lock: () -> Unit) {
     val c = LocalContext.current
     val repo = remember { VaultRepository(c, CryptoManager()) }
-    var files by remember { mutableStateOf(repo.list()) }
+    val scope = rememberCoroutineScope()
+    var files by remember { mutableStateOf(emptyList<VaultFile>()) }
     var search by remember { mutableStateOf("") }
     var sort by remember { mutableStateOf(0) }
     var selected by remember { mutableStateOf<VaultFile?>(null) }
+    var busy by remember { mutableStateOf(false) }
+    var status by remember { mutableStateOf("") }
+
+    fun refresh() {
+        scope.launch {
+            files = withContext(Dispatchers.IO) { repo.list() }
+        }
+    }
+
+    LaunchedEffect(Unit) { refresh() }
 
     val picker = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenMultipleDocuments()
     ) { uris ->
-        uris.forEach { uri ->
-            runCatching {
-                val name = queryName(c, uri)
-                val mime = c.contentResolver.getType(uri) ?: guessMime(name)
-                repo.importUri(uri, name, mime)
+        if (uris.isEmpty()) return@rememberLauncherForActivityResult
+        scope.launch {
+            busy = true
+            status = "Импорт: 0/${uris.size}"
+            var done = 0
+            for (uri in uris) {
+                runCatching {
+                    withContext(Dispatchers.IO) {
+                        val name = queryName(c, uri)
+                        val mime = c.contentResolver.getType(uri) ?: guessMime(name)
+                        repo.importUri(uri, name, mime)
+                    }
+                }.onFailure { status = "Ошибка: ${it.message ?: "импорт"}" }
+                done++
+                status = "Импорт: $done/${uris.size}"
             }
+            files = withContext(Dispatchers.IO) { repo.list() }
+            busy = false
+            status = ""
         }
-        files = repo.list()
     }
 
-    val shown = files
-        .filter { it.name.contains(search, true) }
-        .let {
+    val shown = remember(files, search, sort) {
+        files.filter { it.name.contains(search, true) }.let {
             when (sort) {
                 1 -> it.sortedBy { f -> f.name.lowercase() }
                 2 -> it.sortedByDescending { f -> f.size }
                 else -> it.sortedBy { f -> f.name.lowercase() }
             }
         }
+    }
 
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text("Secure Vault") },
                 actions = {
-                    IconButton(onClick = lock) {
-                        Icon(Icons.Default.Lock, "Заблокировать")
-                    }
+                    IconButton(onClick = lock) { Icon(Icons.Default.Lock, "Заблокировать") }
                 }
             )
         },
         floatingActionButton = {
-            FloatingActionButton(onClick = { picker.launch(arrayOf("*/*")) }) {
+            FloatingActionButton(onClick = { if (!busy) picker.launch(arrayOf("*/*")) }) {
                 Icon(Icons.Default.Add, "Добавить файл")
             }
         }
     ) { pad ->
         Column(Modifier.padding(pad).fillMaxSize().padding(16.dp)) {
-            Text(
-                "Защищённое хранилище",
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.Bold
-            )
+            Text("Защищённое хранилище", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
             Text("${shown.size} файлов", style = MaterialTheme.typography.bodyMedium)
+            if (busy) {
+                Spacer(Modifier.height(6.dp))
+                LinearProgressIndicator(Modifier.fillMaxWidth())
+                Text(status, style = MaterialTheme.typography.bodySmall)
+            }
             Spacer(Modifier.height(12.dp))
             OutlinedTextField(
                 value = search,
@@ -235,12 +260,17 @@ fun VaultHome(lock: () -> Unit) {
                     Text(when (sort) { 0, 1 -> "Имя"; else -> "Размер" })
                 }
             }
-            LazyColumn {
+            LazyColumn(Modifier.fillMaxSize()) {
                 items(shown, key = { it.id }) { f ->
                     FileRow(
                         f,
                         open = { selected = f },
-                        delete = { repo.delete(f); files = repo.list() }
+                        delete = {
+                            scope.launch {
+                                withContext(Dispatchers.IO) { repo.delete(f) }
+                                files = withContext(Dispatchers.IO) { repo.list() }
+                            }
+                        }
                     )
                 }
             }
@@ -254,8 +284,7 @@ fun VaultHome(lock: () -> Unit) {
 @Composable
 fun FileRow(f: VaultFile, open: () -> Unit, delete: () -> Unit) {
     Card(
-        Modifier.fillMaxWidth().padding(vertical = 5.dp)
-            .combinedClickable(onClick = open, onLongClick = delete),
+        Modifier.fillMaxWidth().padding(vertical = 5.dp).combinedClickable(onClick = open, onLongClick = delete),
         shape = RoundedCornerShape(18.dp)
     ) {
         Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -279,9 +308,7 @@ fun iconFor(m: String) = when {
     else -> Icons.Default.InsertDriveFile
 }
 
-fun queryName(c: Context, u: Uri) = c.contentResolver.query(
-    u, arrayOf("_display_name"), null, null, null
-)?.use {
+fun queryName(c: Context, u: Uri) = c.contentResolver.query(u, arrayOf("_display_name"), null, null, null)?.use {
     if (it.moveToFirst()) it.getString(0) else "file"
 } ?: u.lastPathSegment?.substringAfterLast('/') ?: "file"
 
@@ -308,12 +335,12 @@ fun sizeText(n: Long): String {
 @Composable
 fun PreviewDialog(f: VaultFile, repo: VaultRepository, close: () -> Unit) {
     val c = LocalContext.current
+    val scope = rememberCoroutineScope()
     var temp by remember { mutableStateOf<File?>(null) }
     var error by remember { mutableStateOf("") }
+    var opening by remember { mutableStateOf(false) }
 
-    DisposableEffect(Unit) {
-        onDispose { temp?.delete() }
-    }
+    DisposableEffect(Unit) { onDispose { temp?.delete() } }
 
     AlertDialog(
         onDismissRequest = close,
@@ -324,30 +351,34 @@ fun PreviewDialog(f: VaultFile, repo: VaultRepository, close: () -> Unit) {
                 Text("Тип: ${f.mime}")
                 Spacer(Modifier.height(14.dp))
                 if (error.isNotEmpty()) Text(error)
-                Button(onClick = {
-                    runCatching {
-                        val x = File.createTempFile("sv_preview_", suffix(f.name), c.cacheDir)
-                        repo.decryptTo(f, x)
-                        temp = x
-                        val uri = FileProvider.getUriForFile(c, "${c.packageName}.files", x)
-                        c.startActivity(
-                            Intent(Intent.ACTION_VIEW).apply {
-                                setDataAndType(uri, f.mime)
-                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                            }
-                        )
-                    }.onFailure { error = it.message ?: "Ошибка" }
-                }) {
-                    Text("Открыть")
-                }
+                Button(
+                    enabled = !opening,
+                    onClick = {
+                        scope.launch {
+                            opening = true
+                            error = ""
+                            runCatching {
+                                val x = withContext(Dispatchers.IO) {
+                                    File.createTempFile("sv_preview_", suffix(f.name), c.cacheDir).also {
+                                        repo.decryptTo(f, it)
+                                    }
+                                }
+                                temp?.delete()
+                                temp = x
+                                val uri = FileProvider.getUriForFile(c, "${c.packageName}.files", x)
+                                c.startActivity(Intent(Intent.ACTION_VIEW).apply {
+                                    setDataAndType(uri, f.mime)
+                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                })
+                            }.onFailure { error = it.message ?: "Ошибка открытия файла" }
+                            opening = false
+                        }
+                    }
+                ) { Text(if (opening) "Открытие…" else "Открыть") }
             }
         },
-        confirmButton = {
-            TextButton(onClick = close) { Text("Закрыть") }
-        }
+        confirmButton = { TextButton(onClick = close) { Text("Закрыть") } }
     )
 }
 
-fun suffix(n: String) = n.substringAfterLast('.', ".tmp").let {
-    if (it.startsWith(".")) it else ".${it}"
-}
+fun suffix(n: String) = n.substringAfterLast('.', ".tmp").let { if (it.startsWith(".")) it else ".${it}" }
